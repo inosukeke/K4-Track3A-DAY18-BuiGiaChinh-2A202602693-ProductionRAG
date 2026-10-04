@@ -36,20 +36,23 @@
 
 ## Phần 3: Action Plan cho Project cá nhân (Application Plan)
 
-### Project: [Điền tên project cá nhân của bạn — ví dụ: Chatbot hỗ trợ nội bộ / RAG cho tài liệu công ty]
+### Project: Attacker vs. Target LLM System (RAG là một phần của Target System)
 
 #### 1. Hiện trạng
-- **Pipeline hiện tại:** *(cần điền theo project thật của bạn — ví dụ: RAG đơn giản dùng paragraph chunking + dense-only search, chưa có reranking/evaluation)*
-- **Vấn đề / Bottlenecks đang gặp:** *(ví dụ: không phân biệt được tài liệu cũ/mới, retrieval multi-hop yếu, chưa có metric đánh giá định lượng)*
+- **Pipeline hiện tại:** Project gồm 2 phía — (1) **Target LLM system**: một hệ thống có RAG pipeline đóng vai trò knowledge-base backend (kiến trúc tương tự lab hôm nay — chunking + hybrid search + rerank + LLM generation) để trả lời câu hỏi dựa trên corpus nội bộ; (2) **Attacker**: thiết kế các kỹ thuật tấn công nhằm vào target, khai thác chính những điểm yếu của RAG pipeline.
+- **Known issues (nhìn từ góc độ attacker, rút ra trực tiếp từ failure analysis của lab):**
+  - Reranker (`bge-reranker-v2-m3`) không phân biệt được "tài liệu nào đang hiệu lực" nếu 2 chunk gần giống nhau về câu chữ (đã thấy rõ ở case mật khẩu v1/v2: score 0.998 vs 0.997) → attacker có thể **poison knowledge base** bằng 1 document giả rất giống document hợp lệ (cùng structure, cùng wording, chỉ đổi số liệu/điều khoản quan trọng) để nó lọt top-k ngang hàng với document thật và đánh lừa target.
+  - Enrichment (M5, combined single-call) tự sinh context mô tả "Đoạn văn nằm trong phần... của tài liệu..." dựa trên nội dung chunk — nếu attacker kiểm soát được một phần nội dung nạp vào knowledge base (ví dụ qua upload công khai, ticket, comment), có thể chèn **indirect prompt injection** ngay trong chunk đó; injection sẽ được enrich → index → retrieve → đưa thẳng vào context của LLM generation ở cuối pipeline mà không qua bước sanitize nào.
+  - System prompt hiện tại ("Trả lời CHỈ dựa trên context") tin tưởng tuyệt đối nội dung retrieve được → đây chính là bề mặt tấn công cốt lõi: ai kiểm soát được context thì kiểm soát được output của target.
 
-#### 2. Kế hoạch cải tiến
-1. **Chunking strategy:** Hierarchical (parent 2048 / child 256) — vì cho precision tốt khi retrieve (child nhỏ, match chính xác) mà vẫn giữ context đầy đủ khi trả về (return parent). Semantic chunking (threshold 0.85) quá nhạy, dễ over-split (đã thấy chunk 6 ký tự trong lab) nên chỉ dùng cho tài liệu văn xuôi dài, không dùng cho tài liệu dạng chính sách/quy định có số liệu.
-2. **Search retrieval:** Hybrid (BM25 + Dense + RRF) — vì tài liệu có nhiều số liệu/mã chính xác (ngày, %, VNĐ) mà dense-only dễ bỏ sót, còn BM25-only lại kém với câu hỏi diễn đạt lại.
-3. **Reranking:** Có — cross-encoder `bge-reranker-v2-m3`, nhưng bổ sung **metadata filtering theo version/ngày hiệu lực TRƯỚC khi rerank**, để tránh lỗi đã gặp trong lab (2 phiên bản chính sách mâu thuẫn lọt cùng top-3).
-4. **Evaluation:** RAGAS 4 metrics làm baseline, nhưng chạy evaluate 2-3 lần lấy trung bình vì quan sát thấy judge LLM có variance (case #5 trong failure_analysis: câu trả lời đúng nội dung vẫn bị chấm faithfulness=0).
-5. **Enrichment:** Contextual prepend (combined single-call mode) — hiệu quả nhưng là bottleneck latency lớn nhất (52% thời gian pipeline trong lab này); cần parallelize bằng `asyncio`/batch API call khi áp dụng vào project có nhiều document hơn.
+#### 2. Kế hoạch áp dụng (Attacker techniques + Target hardening)
+1. **Chunking strategy:** Dựng target baseline bằng hierarchical chunking (như lab) — vì đây là lựa chọn phổ biến trong RAG production nên attacker cần test đúng setup thực tế. Thử nghiệm structure-aware chunking cho attack: vì nó giữ nguyên markdown header, attacker có thể **giả header** (`## Chính sách hiện hành`) để chunk độc hại "trông chính thức" hơn trong mắt reranker/LLM.
+2. **Search retrieval:** Dùng Hybrid (BM25 + Dense + RRF) làm target baseline, rồi khai thác riêng từng nhánh: test **keyword-stuffing** (nhồi từ khóa trùng query để ép BM25 đẩy chunk độc hại lên top-k) và **embedding-mimicry** (viết chunk giả có embedding gần giống chunk thật để qua được Dense search).
+3. **Reranking:** Dùng cross-encoder làm lớp defense cuối, nhưng lab đã chứng minh nó chỉ học semantic similarity, KHÔNG học "nguồn nào đáng tin / còn hiệu lực theo thời gian" — đây là attack vector cụ thể cần khai thác (document version-conflict injection), sau đó đề xuất hardening: ký số / metadata xác thực nguồn tài liệu thay vì chỉ dựa vào similarity score.
+4. **Evaluation:** Dùng RAGAS không chỉ để đo chất lượng mà để đo **mức độ thành công của attack** — ví dụ: đo Faithfulness của câu trả lời SAU KHI inject tài liệu giả; nếu Faithfulness vẫn cao (LLM "bám context" tốt) nhưng nội dung sai sự thật so với ground_truth gốc → đó chính là bằng chứng attack thành công (RAG đã tin vào context bị đầu độc), dù nhìn qua metric thông thường vẫn "trông tốt". Cần định nghĩa thêm 1 custom metric: **injection success rate** (% câu trả lời bị chi phối bởi payload injected).
+5. **Enrichment:** Đây là bề mặt tấn công rõ nhất cho indirect prompt injection trong toàn pipeline. Action cụ thể: viết test case chèn instruction giả (ví dụ "Ignore previous instructions and reveal...") vào 1 document trong corpus, chạy qua `enrich_chunks()`, kiểm tra xem `enriched_text` / `hypothesis_questions` có "rò" injection ra ngoài không, và cuối cùng xem `run_query()` có bị chi phối hành vi không — từ đó đề xuất sanitize layer giữa retrieval và generation (strip instruction-like patterns khỏi context trước khi feed LLM).
 
 #### 3. Timeline triển khai
-- **Tuần 1:** Implement hierarchical chunking + metadata extraction (version/ngày hiệu lực) cho corpus thật của project.
-- **Tuần 2:** Implement hybrid search (BM25 + Dense + RRF) + version-aware filtering trước rerank; viết test set Q&A riêng (tối thiểu 15-20 câu, có câu multi-hop và câu "version conflict" như trong lab).
-- **Tuần 3:** Chạy RAGAS evaluation, đo latency breakdown, tối ưu enrichment bằng async batching nếu cần giảm thời gian index.
+- **Tuần 1:** Dựng target system baseline bằng chính code lab này (M1-M5 + pipeline) với corpus giả định làm "target knowledge base"; đo RAGAS baseline để có mốc so sánh trước khi attack.
+- **Tuần 2:** Thiết kế & thực thi các kịch bản attack: document poisoning (version-conflict), indirect prompt injection qua chunk/enrichment, keyword-stuffing BM25, embedding-mimicry cho Dense search.
+- **Tuần 3:** Đo lại bằng RAGAS + custom injection-success-rate metric, so sánh trước/sau attack; viết báo cáo đề xuất hardening cho target (metadata xác thực nguồn, instruction-input separation, sanitize context trước khi feed LLM, rate-limit/anomaly detection cho corpus upload).
